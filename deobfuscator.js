@@ -1,19 +1,18 @@
 /**
- * Zorr Deobfuscator v2 — Self-contained, fully automated.
- * 
- * Takes webcracked.js and produces zorr-deobfuscated.js.
+ * Zorr Deobfuscator v2 — importable module.
+ *
+ * deobfuscate(webcrackedCode: string) → { code, stats }
  * Dynamically extracts and executes the decoder from the source itself.
  * No external JSON data files required.
  */
-const fs = require('fs');
 const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const generate = require('@babel/generator').default;
 const bt = require('@babel/types');
 const vm = require('vm');
 
+function deobfuscate(sourceCode) {
 console.log('=== Zorr Deobfuscator v2 ===');
-const sourceCode = fs.readFileSync('webcracked.js', 'utf8');
 
 // ========================================================================
 // PHASE 1: Parse AST and extract decoder infrastructure
@@ -437,330 +436,71 @@ if (dollarArray) {
 }
 
 
-// NEW PHASE 6 — paste into deobfuscator.js replacing lines 367-687
-// Auto-detect .$N property mangles using context heuristics
+// PHASE 6 — resolve .$N mangled members using the ground-truth mapping extracted at runtime.
+// The obfuscator renames built-in methods (Math.*, canvas ctx.*, document.*, DataView.*) to $N
+// and restores them at runtime via JSON mapping tables. The mapping below was captured by
+// executing the game's own runtime un-mangling code (u + w tables).
+console.log('Phase 6: Resolving .$N property mangles from ground-truth mapping...');
 
-console.log('Phase 6: Auto-detecting .$N property mangle mappings...');
+const MANGLE_MAP = {
+    // Math
+    floor: '$6', random: '$7', round: '$8', pow: '$9', ceil: '$10',
+    min: '$11', abs: '$12', cos: '$13', sin: '$14', exp: '$15',
+    hypot: '$16', acos: '$17', max: '$18', sign: '$52', log2: '$59',
+    atan2: '$69', sqrt: '$82',
+    // CanvasRenderingContext2D methods
+    lineTo: '$19', moveTo: '$20', ellipse: '$21', quadraticCurveTo: '$22',
+    bezierCurveTo: '$23', closePath: '$24', arc: '$25', save: '$26',
+    rotate: '$27', beginPath: '$28', fill: '$30', clip: '$31',
+    stroke: '$36', restore: '$37', scale: '$38', translate: '$40',
+    rect: '$41', strokeText: '$45', fillText: '$46', setLineDash: '$49',
+    strokeRect: '$51', createPattern: '$60', fillRect: '$65', clearRect: '$66',
+    roundRect: '$70', measureText: '$71', drawImage: '$72', setTransform: '$77',
+    createImageData: '$83', putImageData: '$84',
+    // document
+    createElement: '$5', querySelectorAll: '$61', querySelector: '$62',
+    exitFullscreen: '$63', getElementById: '$64', elementFromPoint: '$67',
+    // DataView
+    setUint32: '$53', setUint8: '$54', getUint32: '$55', setUint16: '$56',
+    getUint16: '$57', getUint8: '$58', setFloat32: '$73', getTransform: '$75',
+    getBigUint64: '$80', getFloat32: '$81',
+    // misc
+    addEventListener: '$68', removeEventListener: '$85',
+};
+
+// Canvas/document *properties* (resolved via runtime accessor patching, not in the method map).
+// Distinguished from methods by usage: assigned (ctx.$29 = x) vs called.
+const PROP_MAP = {
+    $29: 'strokeStyle', $32: 'lineJoin', $33: 'lineCap', $34: 'lineWidth',
+    $35: 'shadowColor', $39: 'globalAlpha', $42: 'textBaseline', $43: 'font',
+    $44: 'textAlign', $47: 'shadowBlur', $48: 'strokeStyle', $50: 'globalCompositeOperation',
+    $74: 'shadowOffsetX', $76: 'shadowOffsetY', $78: 'imageSmoothingEnabled',
+    $79: 'shadowOffsetX', $27: 'rotate', $39: 'globalAlpha',
+};
+
+// Build reverse lookup: $N → real name
+const reverse = {};
+for (const [name, dn] of Object.entries(MANGLE_MAP)) reverse[dn] = name;
+for (const [dn, name] of Object.entries(PROP_MAP)) reverse[dn] = name;
+
 let code = generate(ast, { retainLines: false, compact: false }).code;
 
-function countP(p) { return (code.match(p) || []).length; }
 const allDn = new Set();
 { let m; const re = /\.(\$\d+)/g; while (m = re.exec(code)) allDn.add(m[1]); }
 console.log('  Found ' + allDn.size + ' unique .$N patterns.');
 
-const detected = {}; // dn → { name, scope }
-
-// ── MATH: only $N used exclusively on Math ──
-const mathDns = [];
+let resolvedCount = 0;
+const unresolved = [];
 for (const dn of allDn) {
-    const n = dn.slice(1);
-    const mc = countP(new RegExp('Math\\.\\$' + n + '\\(', 'g'));
-    const tc = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-    const tp = countP(new RegExp('\\.\\$' + n + '(?![\\d(])', 'g'));
-    if (mc > 0 && mc === tc + tp) mathDns.push({ dn, count: mc });
-}
-
-// Classify each Math.$N by argument/usage signature
-for (const { dn, count } of mathDns) {
-    const n = dn.slice(1);
-    const zeroArg = countP(new RegExp('Math\\.\\$' + n + '\\(\\)', 'g'));
-    const twoArg = countP(new RegExp('Math\\.\\$' + n + '\\([^,)]+,\\s*[^,)]+\\)', 'g'));
-    const multAfter = countP(new RegExp('Math\\.\\$' + n + '\\([^)]+\\)\\s*\\*', 'g'));
-    const wrapsM = countP(new RegExp('Math\\.\\$' + n + '\\(Math\\.', 'g'));
-
-    if (zeroArg > count * 0.5) detected[dn] = { name: 'random', scope: 'Math' };
-    else if (twoArg > count * 0.4) detected[dn] = { name: '_2arg', scope: 'Math' };
-    else if (multAfter > count * 0.6) detected[dn] = { name: '_trig', scope: 'Math' };
-    else if (wrapsM > count * 0.15) detected[dn] = { name: '_wrap', scope: 'Math' };
-    else if (count > 20) detected[dn] = { name: '_1arg', scope: 'Math' };
-    else detected[dn] = { name: 'sign', scope: 'Math' };
-}
-
-// Disambiguate _trig → cos/sin pair (cos for X in lineTo, sin for Y)
-const trigs = Object.entries(detected).filter(([,v]) => v.name === '_trig');
-if (trigs.length >= 2) {
-    // Find which appears first in lineTo-like context (X position = cos)
-    trigs.sort((a, b) => {
-        const ai = code.indexOf('Math.' + a[0] + '(');
-        const bi = code.indexOf('Math.' + b[0] + '(');
-        return ai - bi;
-    });
-    // In lineTo(cos(a)*r, sin(a)*r), cos comes first (X), sin second (Y)
-    detected[trigs[0][0]].name = 'cos';
-    detected[trigs[1][0]].name = 'sin';
-    for (let i = 2; i < trigs.length; i++) detected[trigs[i][0]].name = 'abs';
-} else if (trigs.length === 1) {
-    detected[trigs[0][0]].name = 'abs'; // single high-mult = abs
-}
-
-// Disambiguate _2arg → pow, min, max, hypot, atan2
-const twoArgs = Object.entries(detected).filter(([,v]) => v.name === '_2arg');
-for (const [dn] of twoArgs) {
-    const n = dn.slice(1);
-    const count = mathDns.find(x => x.dn === dn).count;
-    // atan2 has (dy,dx) with subtraction patterns
-    const subArg = countP(new RegExp('Math\\.\\$' + n + '\\([^,]*-[^,]+,\\s*[^)]*-', 'g'));
-    // max often clamps to 0: Math.$N(value, 0)
-    const zeroClamp = countP(new RegExp('Math\\.\\$' + n + '\\([^,]+,\\s*0\\)', 'g'));
-    const zeroFirst = countP(new RegExp('Math\\.\\$' + n + '\\(0,', 'g'));
-    // pow has small exponent: Math.$N(base, 0.5/2/3/0.7)
-    const smallExp = countP(new RegExp('Math\\.\\$' + n + '\\([^,]+,\\s*[0-3](\\.\\d)?\\)', 'g'));
-    
-    if (count < 10 && subArg > 0) detected[dn].name = 'atan2';
-    else if (smallExp > count * 0.2) detected[dn].name = 'pow';
-    else if (zeroClamp > count * 0.1 || zeroFirst > count * 0.1) detected[dn].name = 'max';
-    else if (count > 40) detected[dn].name = 'min';
-    else detected[dn].name = 'hypot';
-}
-// If both min and max detected, verify by count (max usually > min)
-const minMax = Object.entries(detected).filter(([,v]) => v.name === 'min' || v.name === 'max');
-if (minMax.length === 2) {
-    const [a, b] = minMax;
-    const ac = mathDns.find(x => x.dn === a[0]).count;
-    const bc = mathDns.find(x => x.dn === b[0]).count;
-    if (ac > bc) { detected[a[0]].name = 'max'; detected[b[0]].name = 'min'; }
-    else { detected[a[0]].name = 'min'; detected[b[0]].name = 'max'; }
-}
-
-// Disambiguate _wrap → floor, round, ceil (by frequency: floor >> round > ceil)
-const wraps = Object.entries(detected).filter(([,v]) => v.name === '_wrap');
-wraps.sort((a, b) => mathDns.find(x => x.dn === b[0]).count - mathDns.find(x => x.dn === a[0]).count);
-const wrapNames = ['floor', 'round', 'ceil', 'trunc'];
-wraps.forEach(([dn], i) => { detected[dn].name = wrapNames[Math.min(i, wrapNames.length - 1)]; });
-
-// Disambiguate _1arg → abs (highest count remaining)
-const oneArgs = Object.entries(detected).filter(([,v]) => v.name === '_1arg');
-oneArgs.sort((a, b) => mathDns.find(x => x.dn === b[0]).count - mathDns.find(x => x.dn === a[0]).count);
-if (oneArgs.length > 0) detected[oneArgs[0][0]].name = 'abs';
-for (let i = 1; i < oneArgs.length; i++) detected[oneArgs[i][0]].name = 'sign';
-
-// ── DOCUMENT: only $N used exclusively on document ──
-for (const dn of allDn) {
-    if (detected[dn]) continue;
-    const n = dn.slice(1);
-    const dc = countP(new RegExp('document\\.\\$' + n + '\\(', 'g'));
-    const tc = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-    const tp = countP(new RegExp('\\.\\$' + n + '(?![\\d(])', 'g'));
-    if (dc > 0 && dc === tc + tp) {
-        const tag = countP(new RegExp('document\\.\\$' + n + '\\("(?:style|canvas|script|link|div|span|img|input)"', 'g'));
-        const sel = countP(new RegExp('document\\.\\$' + n + '\\("[\\[.#]', 'g'));
-        const evt = countP(new RegExp('document\\.\\$' + n + '\\("(?:click|mouse|key|touch|scroll|resize|pointer|wheel|DOM|load)', 'g'));
-        if (tag > 0) detected[dn] = { name: 'createElement', scope: 'document' };
-        else if (sel > 0) detected[dn] = { name: 'querySelectorAll', scope: 'document' };
-        else if (evt > 0) detected[dn] = { name: 'addEventListener', scope: 'document' };
-        else detected[dn] = { name: 'querySelector', scope: 'document' };
-    }
-}
-
-// ── CANVAS PROPERTIES: pure props (NEVER called as method) with distinctive values ──
-for (const dn of allDn) {
-    if (detected[dn]) continue;
-    const n = dn.slice(1);
-    const callC = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-    if (callC > 0) continue; // MUST be pure property, never called
-    const propC = countP(new RegExp('\\.\\$' + n + '\\s*=', 'g'));
-    if (propC === 0) continue;
-
-    const colorV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*(?:this\\.As\\(|"(?:rgba|hsla|#))', 'g'));
-    const roundV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*"(?:round|butt|square|miter|bevel)"', 'g'));
-    const fontV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*"(?:bolder|bold|normal|italic)\\s', 'g'));
-    const baseV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*"(?:top|middle|bottom|alphabetic)"', 'g'));
-    const alignV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*"(?:center|left|right|start|end)"', 'g'));
-    const compV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*"(?:source-|destination-|lighter)"', 'g'));
-    const negV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*-', 'g'));
-
-    if (colorV > propC * 0.3 && propC > 100) detected[dn] = { name: 'fillStyle', scope: 'prop' };
-    else if (colorV > propC * 0.3 && propC > 5) detected[dn] = { name: 'shadowColor', scope: 'prop' };
-    else if (roundV > 0) detected[dn] = { name: '_jc', scope: 'prop' };
-    else if (fontV > 0) detected[dn] = { name: 'font', scope: 'prop' };
-    else if (baseV > 0) detected[dn] = { name: 'textBaseline', scope: 'prop' };
-    else if (alignV > 0) detected[dn] = { name: 'textAlign', scope: 'prop' };
-    else if (compV > 0) detected[dn] = { name: 'globalCompositeOperation', scope: 'prop' };
-    else if (propC > 50) detected[dn] = { name: 'lineWidth', scope: 'prop' };
-    else if (propC > 10) {
-        const decV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*0?\\.\\d', 'g'));
-        detected[dn] = { name: decV > propC * 0.15 ? 'globalAlpha' : 'strokeStyle', scope: 'prop' };
-    }
-    else if (propC > 3) detected[dn] = { name: 'shadowBlur', scope: 'prop' };
-    else if (negV > 0) detected[dn] = { name: 'shadowOffsetX', scope: 'prop' };
-    else if (propC <= 2) detected[dn] = { name: 'imageSmoothingQuality', scope: 'prop' };
-}
-// Disambiguate lineJoin/lineCap pair
-const jcs = Object.entries(detected).filter(([,v]) => v.name === '_jc');
-if (jcs.length === 2) {
-    const [a, b] = jcs.map(([k]) => k);
-    const ai = code.indexOf('.' + a), bi = code.indexOf('.' + b);
-    detected[ai < bi ? a : b].name = 'lineJoin';
-    detected[ai < bi ? b : a].name = 'lineCap';
-} else jcs.forEach(([k]) => { detected[k].name = 'lineJoin'; });
-
-// ── CANVAS/PATH2D METHODS: distinctive call signatures ──
-// Find lineTo first (high freq + Math trig args)
-let lineToVar = null;
-for (const dn of allDn) {
-    if (detected[dn]) continue;
-    const n = dn.slice(1);
-    const callC = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-    if (callC < 400) continue;
-    const trigArg = countP(new RegExp('\\.\\$' + n + '\\(Math\\.', 'g'));
-    if (trigArg > callC * 0.05) {
-        detected[dn] = { name: 'lineTo', scope: 'method' };
-        const vm = code.match(new RegExp('(\\w+)\\.\\$' + n + '\\(', 'g'));
-        if (vm) {
-            const vars = {};
-            vm.forEach(v => { const vn = v.split('.')[0]; vars[vn] = (vars[vn]||0)+1; });
-            lineToVar = Object.entries(vars).sort((a,b) => b[1]-a[1])[0][0];
-        }
-        break;
-    }
-}
-// moveTo: similar count, same primary variable as lineTo
-if (lineToVar) {
-    for (const dn of allDn) {
-        if (detected[dn]) continue;
-        const n = dn.slice(1);
-        const callC = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-        if (callC < 300 || callC > 800) continue;
-        const onVar = countP(new RegExp(lineToVar + '\\.\\$' + n + '\\(', 'g'));
-        if (onVar > callC * 0.8) { detected[dn] = { name: 'moveTo', scope: 'method' }; break; }
-    }
-}
-// Other methods with very distinctive signatures
-for (const dn of allDn) {
-    if (detected[dn]) continue;
-    const n = dn.slice(1);
-    const callC = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-    if (callC === 0) continue;
-    const propC = countP(new RegExp('\\.\\$' + n + '\\s*=', 'g'));
-    if (propC > callC * 0.3) continue;
-    if (countP(new RegExp('Math\\.\\$' + n + '\\(', 'g')) > 0) continue;
-    if (countP(new RegExp('document\\.\\$' + n + '\\(', 'g')) > 0) continue;
-
-    const seqOff = countP(new RegExp('\\.\\$' + n + '\\(\\w+\\+\\+', 'g'));
-    const measW = countP(new RegExp('\\.\\$' + n + '\\([^)]*\\)\\.width', 'g'));
-    const rectArg = countP(new RegExp('\\.\\$' + n + '\\(0,\\s*0,', 'g'));
-    const fiveArg = countP(new RegExp('\\.\\$' + n + '\\([^)]*,[^)]*,[^)]*,[^)]*,[^)]*\\)', 'g'));
-
-    if (seqOff > callC * 0.3 && callC > 20) detected[dn] = { name: 'setUint8', scope: 'method' };
-    else if (measW > 0 && callC < 20) detected[dn] = { name: 'measureText', scope: 'method' };
-    else if (fiveArg > callC * 0.3 && callC < 20) detected[dn] = { name: 'roundRect', scope: 'method' };
-    else if (rectArg > callC * 0.5 && callC < 30) {
-        const clr = countP(new RegExp('\\.\\$' + n + '\\(0,\\s*0,\\s*\\w+\\.(?:canvas|width)', 'g'));
-        detected[dn] = { name: clr > rectArg * 0.3 ? 'clearRect' : 'fillRect', scope: 'method' };
-    }
-}
-
-// ── CO-OCCURRENCE TIER: canvas methods sharing primary canvas variable ──
-if (lineToVar) {
-    // Known canvas method signatures for identification by arg count + frequency
-    // 0-arg (sorted by expected frequency): beginPath, closePath, save, restore, fill, stroke, clip
-    // 2-arg: translate, scale (moveTo/lineTo already detected)
-    // 3-arg: fillText, strokeText
-    // 5+ arg: arc(5-6), ellipse(7-8), quadraticCurveTo(4), bezierCurveTo(6)
-    // Also: drawImage(3-9), setLineDash(1), createPattern(2)
-    
-    const canvasCandidates = [];
-    for (const dn of allDn) {
-        if (detected[dn]) continue;
-        const n = dn.slice(1);
-        const callC = countP(new RegExp('\\.\\$' + n + '\\(', 'g'));
-        const propC = countP(new RegExp('\\.\\$' + n + '\\s*=', 'g'));
-        const total = callC + propC;
-        if (total < 2) continue;
-        const onVar = countP(new RegExp(lineToVar + '\\.\\$' + n + '[\\(\\s=]', 'g'));
-        if (onVar > total * 0.75) {
-            // Count args for methods
-            const zeroA = countP(new RegExp('\\.\\$' + n + '\\(\\)', 'g'));
-            const twoA = countP(new RegExp('\\.\\$' + n + '\\([^,)]+,\\s*[^,)]+\\)', 'g'));
-            const threeA = countP(new RegExp('\\.\\$' + n + '\\([^,)]+,[^,)]+,[^,)]+\\)', 'g'));
-            const fourPlusA = countP(new RegExp('\\.\\$' + n + '\\([^)]*,[^)]*,[^)]*,[^)]*', 'g'));
-            canvasCandidates.push({ dn, callC, propC, total, onVar, zeroA, twoA, threeA, fourPlusA });
-        }
-    }
-    
-    // Sort by total count descending for assignment
-    canvasCandidates.sort((a, b) => b.total - a.total);
-    
-    // Identify 0-arg canvas methods by frequency ranking
-    const zeroArgCands = canvasCandidates.filter(c => c.callC > 0 && c.zeroA > c.callC * 0.5);
-    zeroArgCands.sort((a, b) => b.callC - a.callC);
-    const zeroArgNames = ['beginPath', 'closePath', 'save', 'restore', 'fill', 'stroke', 'clip'];
-    zeroArgCands.forEach((c, i) => {
-        if (i < zeroArgNames.length) detected[c.dn] = { name: zeroArgNames[i], scope: 'method' };
-    });
-    
-    // Identify 2-arg canvas methods (translate, scale — moveTo/lineTo already done)
-    const twoArgCands = canvasCandidates.filter(c => !detected[c.dn] && c.callC > 0 && c.twoA > c.callC * 0.4 && c.fourPlusA < c.callC * 0.2);
-    twoArgCands.sort((a, b) => b.callC - a.callC);
-    // scale typically more frequent than translate
-    if (twoArgCands.length >= 2) {
-        detected[twoArgCands[0].dn] = { name: 'scale', scope: 'method' };
-        detected[twoArgCands[1].dn] = { name: 'translate', scope: 'method' };
-        for (let i = 2; i < twoArgCands.length; i++) detected[twoArgCands[i].dn] = { name: 'rect', scope: 'method' };
-    } else if (twoArgCands.length === 1) {
-        detected[twoArgCands[0].dn] = { name: 'scale', scope: 'method' };
-    }
-    
-    // Identify 4+ arg methods: arc(5-6), quadraticCurveTo(4), bezierCurveTo(6), ellipse(7-8), drawImage
-    const multiArgCands = canvasCandidates.filter(c => !detected[c.dn] && c.callC > 0 && c.fourPlusA > c.callC * 0.3);
-    multiArgCands.sort((a, b) => b.callC - a.callC);
-    for (const c of multiArgCands) {
-        const n = c.dn.slice(1);
-        const sixArg = countP(new RegExp('\\.\\$' + n + '\\([^)]*,[^)]*,[^)]*,[^)]*,[^)]*,[^)]*', 'g'));
-        const fiveArg = countP(new RegExp('\\.\\$' + n + '\\([^)]*,[^)]*,[^)]*,[^)]*,[^)]*\\)', 'g'));
-        if (sixArg > c.callC * 0.3) {
-            // 6+ args: ellipse or bezierCurveTo
-            if (c.callC > 100) detected[c.dn] = { name: 'ellipse', scope: 'method' };
-            else detected[c.dn] = { name: 'bezierCurveTo', scope: 'method' };
-        } else if (fiveArg > c.callC * 0.3) {
-            detected[c.dn] = { name: 'arc', scope: 'method' };
-        } else if (c.callC < 10) {
-            detected[c.dn] = { name: 'drawImage', scope: 'method' };
-        } else {
-            detected[c.dn] = { name: 'quadraticCurveTo', scope: 'method' };
-        }
-    }
-    
-    // Identify 3-arg methods: fillText, strokeText
-    const threeArgCands = canvasCandidates.filter(c => !detected[c.dn] && c.callC > 0 && c.threeA > c.callC * 0.3 && c.fourPlusA < c.callC * 0.2);
-    threeArgCands.sort((a, b) => b.callC - a.callC);
-    const threeArgNames = ['fillText', 'strokeText'];
-    threeArgCands.forEach((c, i) => {
-        if (i < threeArgNames.length) detected[c.dn] = { name: threeArgNames[i], scope: 'method' };
-    });
-    
-    // Canvas properties on primary var: lineWidth, strokeStyle, fillStyle, globalAlpha, etc.
-    const propCands = canvasCandidates.filter(c => !detected[c.dn] && c.propC > 0 && c.callC === 0);
-    for (const c of propCands) {
-        const n = c.dn.slice(1);
-        const colorV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*(?:this\\.As\\(|"(?:rgba|hsla|#))', 'g'));
-        const decV = countP(new RegExp('\\.\\$' + n + '\\s*=\\s*0?\\.\\d', 'g'));
-        if (colorV > c.propC * 0.2 && c.propC > 100) detected[c.dn] = { name: 'strokeStyle', scope: 'prop' };
-        else if (colorV > c.propC * 0.2) detected[c.dn] = { name: 'shadowColor', scope: 'prop' };
-        else if (decV > c.propC * 0.15) detected[c.dn] = { name: 'globalAlpha', scope: 'prop' };
-    }
-    
-    // Remaining unresolved with high canvas co-occurrence: likely canvas methods we couldn't identify
-    // Leave as-is rather than guess wrong
-}
-
-// ── APPLY MAPPINGS ──
-console.log('  Auto-detected ' + Object.keys(detected).length + ' mappings:');
-const sorted = Object.entries(detected).sort((a, b) => parseInt(a[0].slice(1)) - parseInt(b[0].slice(1)));
-for (const [dn, info] of sorted) console.log('    ' + dn + ' → ' + info.name);
-
-for (const [dn, info] of Object.entries(detected)) {
-    const n = dn.slice(1);
-    if (info.scope === 'Math') {
-        code = code.replace(new RegExp('Math\\.\\$' + n + '\\(', 'g'), 'Math.' + info.name + '(');
-    } else if (info.scope === 'document') {
-        code = code.replace(new RegExp('document\\.\\$' + n + '\\(', 'g'), 'document.' + info.name + '(');
-    } else if (info.scope === 'prop') {
-        code = code.replace(new RegExp('\\.\\$' + n + '\\b', 'g'), '.' + info.name);
+    if (reverse[dn]) {
+        code = code.replace(new RegExp('\\.' + dn.replace('$', '\\$') + '(?!\\d)', 'g'), '.' + reverse[dn]);
+        resolvedCount++;
     } else {
-        code = code.replace(new RegExp('\\.\\$' + n + '\\(', 'g'), '.' + info.name + '(');
+        unresolved.push(dn);
     }
 }
+if (unresolved.length) console.log('  Unresolved .$N: ' + unresolved.join(', '));
+console.log('  Resolved ' + resolvedCount + '/' + allDn.size + ' mappings.');
 
 // Bracket-to-dot notation
 code = code.replace(/(\w|\)|\])\["([a-zA-Z_$][a-zA-Z0-9_$]*)"\]/g, '$1.$2');
@@ -768,17 +508,23 @@ code = code.replace(/\["([a-zA-Z_$][a-zA-Z0-9_$]*)"\]\s*:/g, '$1:');
 console.log('  Normalization applied.');
 
 
-// ========================================================================
-// PHASE 7: Write output
-// ========================================================================
-fs.writeFileSync('zorr-deobfuscated.js', code, 'utf8');
-console.log('\n=== Complete ===');
-console.log('Output: zorr-deobfuscated.js');
-console.log('Size:', code.length, 'bytes');
-console.log('Lines:', code.split('\n').length);
 
-// Quick audit
-const remaining_dollar = (code.match(/\.\$\d+/g) || []).length;
-const remaining_es = (code.match(/\.es\(/g) || []).length;
-console.log('Remaining .$N patterns:', remaining_dollar);
-console.log('Remaining .es() calls:', remaining_es);
+// ========================================================================
+// Return result
+// ========================================================================
+const stats = {
+    size: code.length,
+    lines: code.split('\n').length,
+    remainingDollar: (code.match(/\.\$\d+/g) || []).length,
+    remainingEs: (code.match(/\.es\(/g) || []).length,
+};
+console.log('\n=== Complete ===');
+console.log('Size:', stats.size, 'bytes');
+console.log('Lines:', stats.lines);
+console.log('Remaining .$N patterns:', stats.remainingDollar);
+console.log('Remaining .es() calls:', stats.remainingEs);
+
+return { code, stats };
+}
+
+module.exports = { deobfuscate };

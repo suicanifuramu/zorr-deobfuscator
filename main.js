@@ -1,9 +1,19 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
-const { exec } = require("child_process");
+const { webcrack } = require("webcrack");
+const { deobfuscate } = require("./deobfuscator");
 
 const baseUrl = "https://zorr.pages.dev/";
+const dirs = {
+  source: "source",
+  webcrack: "webcrack",
+  deobfuscated: "deobfuscated",
+};
+
+for (const dir of Object.values(dirs)) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
 
 function fetch(url) {
   return new Promise((resolve, reject) => {
@@ -21,20 +31,7 @@ function fetch(url) {
   });
 }
 
-function runCommand(command) {
-  return new Promise((resolve, reject) => {
-    exec(command, (error, stdout, stderr) => {
-      if (error) {
-        reject(stderr || error.message);
-        return;
-      }
-
-      resolve(stdout);
-    });
-  });
-}
-
-async function getLatestJsAndWebcrack() {
+async function getLatestJsAndDeobfuscate() {
   try {
     console.log("HTML取得中...");
 
@@ -60,47 +57,35 @@ async function getLatestJsAndWebcrack() {
 
     console.log("最新JS:", jsFile);
 
-    // 一時保存名
+    // ファイル名 (例: 1K0SNA6KL.js → base名 1K0SNA6KL)
     const fileName = path.basename(jsFile.split("?")[0]);
-
-    // 出力ファイル
-    const outputName = "webcracked.js";
+    const baseName = fileName.replace(/\.js$/, "");
 
     console.log("JSダウンロード中...");
 
-    https.get(jsFile, (res) => {
-      if (res.statusCode !== 200) {
-        console.log("取得失敗:", res.statusCode);
-        return;
-      }
+    const body = await fetch(jsFile);
 
-      const file = fs.createWriteStream(fileName);
+    // source/<name>.js
+    const sourcePath = path.join(dirs.source, fileName);
+    fs.writeFileSync(sourcePath, body, "utf8");
+    console.log("保存完了:", sourcePath);
 
-      res.pipe(file);
+    // webcrack/<name>-webcracked.js
+    console.log("webcrack 実行中...");
+    const result = await webcrack(body);
+    const webcrackedPath = path.join(dirs.webcrack, `${baseName}-webcracked.js`);
+    fs.writeFileSync(webcrackedPath, result.code, "utf8");
+    console.log("保存完了:", webcrackedPath);
 
-      file.on("finish", async () => {
-        file.close();
-
-        console.log("保存完了:", fileName);
-        console.log("webcrack 実行中...");
-
-        try {
-          // webcrack の結果を webcracked.js に保存
-          await runCommand(
-            `npx webcrack "${fileName}" > "${outputName}"`
-          );
-
-          console.log("解析完了:", outputName);
-
-        } catch (err) {
-          console.error("webcrack失敗:", err);
-        }
-      });
-    });
-
+    // deobfuscated/<name>-deobfuscated.js
+    console.log("deobfuscate 実行中...");
+    const deob = deobfuscate(result.code);
+    const deobfuscatedPath = path.join(dirs.deobfuscated, `${baseName}-deobfuscated.js`);
+    fs.writeFileSync(deobfuscatedPath, deob.code, "utf8");
+    console.log("保存完了:", deobfuscatedPath);
   } catch (err) {
     console.error("エラー:", err.message);
   }
 }
 
-getLatestJsAndWebcrack();
+getLatestJsAndDeobfuscate();
