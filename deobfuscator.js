@@ -436,52 +436,88 @@ if (dollarArray) {
 }
 
 
-// PHASE 6 — resolve .$N mangled members using the ground-truth mapping extracted at runtime.
-// The obfuscator renames built-in methods (Math.*, canvas ctx.*, document.*, DataView.*) to $N
-// and restores them at runtime via JSON mapping tables. The mapping below was captured by
-// executing the game's own runtime un-mangling code (u + w tables).
-console.log('Phase 6: Resolving .$N property mangles from ground-truth mapping...');
+// PHASE 6 — resolve .$N mangled members dynamically. The obfuscator embeds its own runtime
+// unmangler IIFE which decodes two JSON tables via JSON.parse(atob(...)): one for method
+// names (Math.*, ctx.*, document.*, DataView.*) and one for property names (ctx.$29 etc),
+// then patches them onto the builtins. We locate that IIFE, run it in a sandbox with fake
+// window/document objects and a recording JSON.parse, and capture the tables — no hardcoding.
+console.log('Phase 6: Resolving .$N property mangles from runtime tables...');
 
-const MANGLE_MAP = {
-    // Math
-    floor: '$6', random: '$7', round: '$8', pow: '$9', ceil: '$10',
-    min: '$11', abs: '$12', cos: '$13', sin: '$14', exp: '$15',
-    hypot: '$16', acos: '$17', max: '$18', sign: '$52', log2: '$59',
-    atan2: '$69', sqrt: '$82',
-    // CanvasRenderingContext2D methods
-    lineTo: '$19', moveTo: '$20', ellipse: '$21', quadraticCurveTo: '$22',
-    bezierCurveTo: '$23', closePath: '$24', arc: '$25', save: '$26',
-    rotate: '$27', beginPath: '$28', fill: '$30', clip: '$31',
-    stroke: '$36', restore: '$37', scale: '$38', translate: '$40',
-    rect: '$41', strokeText: '$45', fillText: '$46', setLineDash: '$49',
-    strokeRect: '$51', createPattern: '$60', fillRect: '$65', clearRect: '$66',
-    roundRect: '$70', measureText: '$71', drawImage: '$72', setTransform: '$77',
-    createImageData: '$83', putImageData: '$84',
-    // document
-    createElement: '$5', querySelectorAll: '$61', querySelector: '$62',
-    exitFullscreen: '$63', getElementById: '$64', elementFromPoint: '$67',
-    // DataView
-    setUint32: '$53', setUint8: '$54', getUint32: '$55', setUint16: '$56',
-    getUint16: '$57', getUint8: '$58', setFloat32: '$73', getTransform: '$75',
-    getBigUint64: '$80', getFloat32: '$81',
-    // misc
-    addEventListener: '$68', removeEventListener: '$85',
-};
-
-// Canvas/document *properties* (resolved via runtime accessor patching, not in the method map).
-// Distinguished from methods by usage: assigned (ctx.$29 = x) vs called.
-const PROP_MAP = {
-    $29: 'strokeStyle', $32: 'lineJoin', $33: 'lineCap', $34: 'lineWidth',
-    $35: 'shadowColor', $39: 'globalAlpha', $42: 'textBaseline', $43: 'font',
-    $44: 'textAlign', $47: 'shadowBlur', $48: 'strokeStyle', $50: 'globalCompositeOperation',
-    $74: 'shadowOffsetX', $76: 'shadowOffsetY', $78: 'imageSmoothingEnabled',
-    $79: 'shadowOffsetX', $27: 'rotate', $39: 'globalAlpha',
-};
-
-// Build reverse lookup: $N → real name
 const reverse = {};
-for (const [name, dn] of Object.entries(MANGLE_MAP)) reverse[dn] = name;
-for (const [dn, name] of Object.entries(PROP_MAP)) reverse[dn] = name;
+let unmanglerNode = null;
+traverse(ast, {
+    noScope: true,
+    CallExpression(path) {
+        if (unmanglerNode) return;
+        const n = path.node;
+        if (!bt.isFunctionExpression(n.callee) || n.end - n.start > 200000) return;
+        const seg = sourceCode.slice(n.start, n.end);
+        // The unmangler decodes >=2 base64 tables (u: methods, w: props) via atob + JSON
+        if ((seg.match(/atob\(/g) || []).length >= 2 && seg.includes('JSON')) {
+            unmanglerNode = n;
+            path.stop();
+        }
+    }
+});
+
+if (unmanglerNode) {
+    try {
+        const tables = [];
+        const recJSON = Object.create(JSON);
+        recJSON.parse = (s) => { const v = JSON.parse(s); tables.push(v); return v; };
+
+        // Self-materializing dummy object: any property access yields another dummy,
+        // so the unmangler's window/HTMLCanvasElement/OffscreenCanvas probing never throws.
+        const mkDummy = () => new Proxy(function () {}, {
+            get(t, p) {
+                if (p === 'prototype') return (t.__proto__ ||= {});
+                if (p === Symbol.toPrimitive) return () => 'dummy';
+                if (p === 'toString' || p === 'valueOf' || p === 'call' || p === 'apply' || p === 'bind') return Function.prototype[p];
+                return (t[p] ||= mkDummy());
+            },
+            apply() { return mkDummy(); },
+            construct() { return {}; }
+        });
+        const win = new Proxy({}, {
+            get(t, p) {
+                if (p in t) return t[p];
+                const known = {
+                    Math, DataView, JSON: recJSON, document: mkDummy(), performance: mkDummy(),
+                    String, Array, Object, Number, Uint8Array, TextDecoder, TextEncoder,
+                    Function, Symbol, Reflect, console,
+                };
+                if (p in known) return (t[p] = known[p]);
+                return (t[p] = mkDummy());
+            }
+        });
+
+        const mCtx = vm.createContext({
+            window: win, document: win.document,
+            JSON: recJSON, Math, DataView, parseInt, atob, btoa,
+            String, Array, Object, Number, console,
+            TextDecoder, Uint8Array, Buffer, TextEncoder,
+            Function, Symbol, Reflect, globalThis: {},
+        });
+        // The unmangler defines getters on fake prototypes; tolerate redefinitions.
+        vm.runInContext("Object.defineProperty=((o)=>function(t,p,d){try{return o(t,p,d)}catch(e){}})(Object.defineProperty);", mCtx);
+        // The unmangler depends on the outer decoder (b) and the shuffled string array.
+        vm.runInContext(aCode + '\n' + bCode + '\n' + shuffleCode + '\n', mCtx);
+        vm.runInContext('(' + generate(unmanglerNode).code + ')', mCtx);
+
+        // Keep only tables whose values all look like $N mangles.
+        for (const t of tables) {
+            const vals = Object.values(t);
+            if (vals.length && vals.every(v => typeof v === 'string' && /^\$\d+$/.test(v))) {
+                for (const [k, v] of Object.entries(t)) reverse[v] = k;
+            }
+        }
+        console.log('  Extracted ' + Object.keys(reverse).length + ' mappings from runtime tables.');
+    } catch (err) {
+        console.log('  Warning: unmangler extraction failed:', err.message);
+    }
+} else {
+    console.log('  Warning: unmangler IIFE not found in source.');
+}
 
 let code = generate(ast, { retainLines: false, compact: false }).code;
 
