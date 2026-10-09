@@ -78,8 +78,6 @@ function deobfuscateWith(sandbox, sourceCode, log) {
     log('\n=== Complete ===');
     log('Size:', stats.size, 'bytes');
     log('Lines:', stats.lines);
-    log('Live layers left as is:', stats.liveLayers.length ? stats.liveLayers.join(', ') : 'none');
-    if (stats.decodedLiveLayers.length) log('Live layers decoded from callbacks:', stats.decodedLiveLayers.join(', '));
     return { code, stats };
 }
 
