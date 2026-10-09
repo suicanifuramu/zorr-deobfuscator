@@ -7,8 +7,7 @@
  * machinery is found by data-flow analysis (lib/analysis.js), reproduced and evaluated in an
  * isolated-vm sandbox, and its results are inlined layer by layer until nothing changes
  * (lib/layers.js). Member renames are undone by observing the code that defines them
- * (lib/unmangle.js). Layers operated from callbacks at run time are decoded too when every
- * runtime operation is reproducible; otherwise they are left as they are.
+ * (lib/unmangle.js). Layers operated from callbacks at run time are decoded like any other.
  * Throws when the input holds no obfuscator machinery at all.
  */
 const parser = require('@babel/parser');
@@ -40,7 +39,7 @@ function deobfuscateWith(sandbox, sourceCode, log) {
     if (!peel.machinery.size) {
         throw new Error('No obfuscator machinery found in source (no string array decoders or constant tables).');
     }
-    const shared = { forced: peel.forced, frozen: peel.frozen };
+    const shared = { forced: peel.forced };
 
     log('Phase 3: Simplifying decoded expressions...');
     const simplified = simplify(ast, sandbox, shared);
@@ -68,7 +67,6 @@ function deobfuscateWith(sandbox, sourceCode, log) {
         decoderCalls: peel.stats.calls,
         tableLookups: peel.stats.lookups,
         inlinedCopies: peel.stats.expressions,
-        liveLayers: peel.stats.liveLayers,
         decodedLiveLayers: peel.stats.decodedLiveLayers,
         ...simplified,
         memberAliases: unmangled.mappings,
