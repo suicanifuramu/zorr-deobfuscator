@@ -7,7 +7,8 @@
  * machinery is found by data-flow analysis (lib/analysis.js), reproduced and evaluated in an
  * isolated-vm sandbox, and its results are inlined layer by layer until nothing changes
  * (lib/layers.js). Member renames are undone by observing the code that defines them
- * (lib/unmangle.js). Layers operated from callbacks at run time are left as they are.
+ * (lib/unmangle.js). Layers operated from callbacks at run time are decoded too when every
+ * runtime operation is reproducible; otherwise they are left as they are.
  * Throws when the input holds no obfuscator machinery at all.
  */
 const parser = require('@babel/parser');
@@ -47,7 +48,7 @@ function deobfuscateWith(sandbox, sourceCode, log) {
         `unwrapped ${simplified.noopCalls} no-op and ${simplified.identityCalls} identity calls.`);
 
     log('Phase 4: Undoing member renames by observing their definitions...');
-    const unmangled = unmangle(ast, sandbox, { ...shared, source: sourceCode, log });
+    const unmangled = unmangle(ast, sandbox, { ...shared, liveScopes: peel.liveScopes, source: sourceCode, log });
     log(`  ${unmangled.mappings} member aliases; renamed ${unmangled.renamed} occurrences` +
         (unmangled.conflicts.length ? `; left ambiguous: ${unmangled.conflicts.join(', ')}` : '') + '.');
 
@@ -68,6 +69,7 @@ function deobfuscateWith(sandbox, sourceCode, log) {
         tableLookups: peel.stats.lookups,
         inlinedCopies: peel.stats.expressions,
         liveLayers: peel.stats.liveLayers,
+        decodedLiveLayers: peel.stats.decodedLiveLayers,
         ...simplified,
         memberAliases: unmangled.mappings,
         memberRenames: unmangled.renamed,
@@ -77,10 +79,12 @@ function deobfuscateWith(sandbox, sourceCode, log) {
     log('Size:', stats.size, 'bytes');
     log('Lines:', stats.lines);
     log('Live layers left as is:', stats.liveLayers.length ? stats.liveLayers.join(', ') : 'none');
+    if (stats.decodedLiveLayers.length) log('Live layers decoded from callbacks:', stats.decodedLiveLayers.join(', '));
     return { code, stats };
 }
 
-// x["y"] → x.y and { ["y"]: v } → { y: v } (string literal contents are never touched).
+// x["y"] → x.y and computed literal keys (objects and class members) → plain names.
+// String literal contents are never touched.
 function normalizeAccess(ast) {
     const counts = { members: 0, keys: 0 };
     const memberVisitor = (path) => {
@@ -96,6 +100,11 @@ function normalizeAccess(ast) {
         const name = node.key.value;
         // { ["__proto__"]: x } defines an own property, { __proto__: x } sets the prototype.
         if (name === '__proto__' || !bt.isValidIdentifier(name, false)) return;
+        // Class members: ["constructor"] is a regular method, constructor is the constructor;
+        // a static member named prototype throws at run time as ["prototype"] and is a
+        // parse error as prototype. Leave these computed.
+        if ((path.isClassMethod() || path.isClassProperty() || path.isClassAccessorProperty()) &&
+            (name === 'constructor' || name === 'prototype')) return;
         node.key = bt.identifier(name);
         node.computed = false;
         counts.keys++;
@@ -105,6 +114,9 @@ function normalizeAccess(ast) {
         OptionalMemberExpression: memberVisitor,
         ObjectProperty: keyVisitor,
         ObjectMethod: keyVisitor,
+        ClassMethod: keyVisitor,
+        ClassProperty: keyVisitor,
+        ClassAccessorProperty: keyVisitor,
     });
     return counts;
 }
