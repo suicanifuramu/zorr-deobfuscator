@@ -26,7 +26,6 @@
     "@babel/traverse": "^8.0.4",
     "@babel/types": "^8.0.4",
     "isolated-vm": "^6.2.0",
-    "jsdom": "^30.0.1",
     "webcrack": "^2.16.0"
   }
 }
